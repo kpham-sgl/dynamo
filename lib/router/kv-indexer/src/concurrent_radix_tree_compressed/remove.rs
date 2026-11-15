@@ -306,13 +306,7 @@ impl ConcurrentRadixTreeCompressed {
         worker: WorkerWithDpRank,
         hashes: &[ExternalSequenceBlockHash],
     ) {
-        // Check the lifecycle once per run, not once per hash: `release_hash` is not
-        // inlined, and a call per evicted block is a measurable share of writer time.
-        if self.lifecycle.is_enabled() {
-            lookup.remove_all(worker, hashes, |hash| self.release_hash(worker, hash));
-        } else {
-            lookup.remove_all(worker, hashes, |_| {});
-        }
+        lookup.remove_all(worker, hashes, |_| {});
     }
 
     pub(super) fn erase_worker_coverage(
@@ -321,10 +315,7 @@ impl ConcurrentRadixTreeCompressed {
         target: WorkerRemovalTarget,
         sweep_tree: bool,
     ) {
-        lookup.remove_workers(
-            |worker| target.matches(worker),
-            |worker, hash| self.release_hash(worker, hash),
-        );
+        lookup.remove_workers(|worker| target.matches(worker), |_, _| {});
         if !sweep_tree {
             return;
         }

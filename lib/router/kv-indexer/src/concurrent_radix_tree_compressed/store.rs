@@ -71,7 +71,6 @@ impl ConcurrentRadixTreeCompressed {
             op.blocks.iter().map(|block| block.block_hash),
             node_id,
         );
-        self.insert_lifecycle_hashes(worker, &op.blocks);
         #[cfg(test)]
         self.bench_metrics
             .tail_appends
@@ -221,7 +220,6 @@ impl ConcurrentRadixTreeCompressed {
         );
 
         lookup.remove(worker, parent_hash);
-        self.release_hash(worker, parent_hash);
         KvCacheEventError::ParentBlockNotFound
     }
 
