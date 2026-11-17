@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, closing, nullcontext
+from contextlib import aclosing, asynccontextmanager, closing, nullcontext
 from typing import (
     Any,
     AsyncIterator,
@@ -3849,16 +3849,69 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 # Token-in-token-out mode: internal protocol format
                 generator = self._generate_token_mode(request, context, request_id)
 
-            async for chunk in _translate_vllm_client_errors(generator):
-                if first_token:
-                    decode_timer.stop_interval()
-                    first_token = False
-                if not self.use_vllm_tokenizer and not first_token_output_seen:
-                    token_ids = chunk.get("token_ids") or []
-                    if token_ids:
-                        first_token_output_seen = True
-                        context.notify_first_token()
-                yield chunk
+            async with (
+                aclosing(generator),
+                aclosing(_translate_vllm_client_errors(generator)) as responses,
+            ):
+                if self.config.disaggregation_mode == DisaggregationMode.AGGREGATED:
+                    chunk = await self._first_output_or_cancel(
+                        responses, context, request_id
+                    )
+                else:
+                    chunk = await anext(responses, None)
+                while chunk is not None:
+                    if first_token:
+                        decode_timer.stop_interval()
+                        first_token = False
+                    if not self.use_vllm_tokenizer and not first_token_output_seen:
+                        token_ids = chunk.get("token_ids") or []
+                        if token_ids:
+                            first_token_output_seen = True
+                            context.notify_first_token()
+                    yield chunk
+                    chunk = await anext(responses, None)
+
+    async def _first_output_or_cancel(
+        self,
+        generator: AsyncIterator[ResponseT],
+        context: Context,
+        request_id: str,
+    ) -> ResponseT | None:
+        """Cancel aggregated admission, including preprocessing, on disconnect.
+
+        Aborting an external ID before vLLM registers it is a no-op. Stop and
+        drain the first iteration before aborting, so it cannot submit work
+        after the abort. Later iterations use the existing abort monitor and
+        incur no additional task or wait per output. Disagg decode must retain
+        its deferred abort to protect in-flight KV transfers.
+        """
+        if context.is_stopped() or context.is_killed():
+            return None
+
+        cancelled = context.async_killed_or_stopped()
+        first_output = asyncio.create_task(anext(generator, None))
+        cancel_admission = True
+        try:
+            done, _ = await asyncio.wait(
+                (cancelled, first_output), return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancelled in done:
+                return None
+            cancel_admission = False
+            return first_output.result()
+        except asyncio.CancelledError:
+            cancel_admission = True
+            raise
+        finally:
+            cancelled.cancel()
+            if cancel_admission:
+                first_output.cancel()
+                try:
+                    await asyncio.gather(first_output, return_exceptions=True)
+                finally:
+                    # Cancellation may interrupt add_request after registration
+                    # but before vLLM.generate owns its output collector.
+                    await asyncio.shield(self.engine_client.abort(request_id))
 
     async def _assemble_custom_encoder_prompt(
         self,
@@ -4095,6 +4148,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             multi_modal_data = prepared_input.multi_modal_data
             mm_processor_kwargs = prepared_input.mm_processor_kwargs
             pre_rendered = prepared_input.pre_rendered_prompt
+
+        # Media preparation can run synchronously without yielding to the
+        # cancellation watcher. Recheck the Rust context before admission.
+        if mode == DisaggregationMode.AGGREGATED and (
+            context.is_stopped() or context.is_killed()
+        ):
+            return
 
         # Build prompt from request. `prompt` is either a pre-rendered
         # MultiModalInput dict (fast path) or a TokensPrompt/EmbedsPrompt from
